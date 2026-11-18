@@ -1,0 +1,19 @@
+# The built binary. `go build` puts it in the module root by default.
+/reasonix-selfhost
+/reasonix-selfhost.exe
+
+# The service's own state: the SQLite file holds the account, the devices and
+# every ticket, so it is the one thing here that must never leave the machine
+# it runs on. The default DATA dir is ./data.
+/data/
+
+# Deployment secrets: the admin token and the two public origins live here.
+# A copy belongs on the server, never in the repository.
+*.env
+.env*
+!.env.example
+
+# Editor and OS noise.
+.DS_Store
+.idea/
+.vscode/

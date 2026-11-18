@@ -1,0 +1,21 @@
+# Two names, one process. Caddy terminates TLS for both and forwards to the
+# loopback address the service listens on; the service itself never sees a
+# certificate and never speaks plain HTTP to a client.
+#
+# Replace the two hostnames and the ACME email, then run `caddy run`.
+{
+	email you@example.com
+}
+
+id.example.com {
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:8790
+}
+
+relay.example.com {
+	# A controller socket is a WebSocket, and its idle gaps are normal: the
+	# kernel pings every 20 s, but a phone in a pocket may be silent longer.
+	reverse_proxy 127.0.0.1:8790 {
+		flush_interval -1
+	}
+}
