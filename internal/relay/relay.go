@@ -223,6 +223,15 @@ func (r *Relay) ControllerConnect(w http.ResponseWriter, req *http.Request) {
 	_ = offered
 	conn.SetReadLimit(maxFrame)
 
+	// A controller that proved its ticket is enrolled before it speaks, so a
+	// report the desktop sends a moment later has a row to land on. The row is
+	// keyed by the phone's user agent for the same reason a browser session is:
+	// the relay has no other stable name for "the same phone again".
+	if _, err := r.store.EnrollController(grant.DeviceID, grant.UserID, req.UserAgent()); err != nil {
+		_ = conn.Close()
+		return
+	}
+
 	id := connectionID()
 	link := &controllerLink{conn: conn, device: grant.DeviceID}
 

@@ -24,6 +24,7 @@ type harness struct {
 	t      *testing.T
 	cfg    config.Config
 	server *httptest.Server
+	store  *store.Store
 }
 
 func newHarness(t *testing.T) *harness {
@@ -51,7 +52,7 @@ func newHarness(t *testing.T) *harness {
 	}
 	httpServer := httptest.NewServer(server.Handler())
 	t.Cleanup(httpServer.Close)
-	return &harness{t: t, cfg: cfg, server: httpServer}
+	return &harness{t: t, cfg: cfg, server: httpServer, store: st}
 }
 
 func (h *harness) do(method, path, token string, body any) (int, map[string]any) {
@@ -74,6 +75,37 @@ func (h *harness) do(method, path, token string, body any) (int, map[string]any)
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		h.t.Fatalf("%s %s: %v", method, path, err)
+	}
+	defer resp.Body.Close()
+	out := map[string]any{}
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	return resp.StatusCode, out
+}
+
+// doDevice is `do` with the two headers a Studio proves itself with on the host
+// routes: the id it claims and the credential that backs it.
+func (h *harness) doDevice(method, path, deviceID, credential string, body any) (int, map[string]any) {
+	h.t.Helper()
+	var reader *bytes.Reader
+	if body != nil {
+		encoded, err := json.Marshal(body)
+		if err != nil {
+			h.t.Fatalf("marshal: %v", err)
+		}
+		reader = bytes.NewReader(encoded)
+	} else {
+		reader = bytes.NewReader(nil)
+	}
+	req, err := http.NewRequest(method, h.server.URL+path, reader)
+	if err != nil {
+		h.t.Fatalf("request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-reasonix-device-id", deviceID)
+	req.Header.Set("x-reasonix-device-credential", credential)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		h.t.Fatalf("%s %s: %v", method, path, err)
@@ -278,6 +310,122 @@ func TestAdminTokenIsRequiredToApprove(t *testing.T) {
 	status, body := h.do(http.MethodPost, "/device/approve", "wrong-token", map[string]string{"userCode": userCode})
 	if status != http.StatusUnauthorized {
 		t.Fatalf("approve with a wrong token = %d %v", status, body)
+	}
+}
+
+// A report the desktop sends is recorded against the phones that reached it,
+// as one kind and one count: nothing about a conversation reaches the row. A
+// repeated kind keeps the larger count instead of queueing a second message.
+func TestNotifyRecordsAReportAgainstEnrolledControllers(t *testing.T) {
+	h := newHarness(t)
+	token := h.signIn()
+
+	status, registered := h.do(http.MethodPost, "/me/devices", token, map[string]any{
+		"name": "test-studio", "platform": "linux", "publicKey": "cHVibGljLWtleQ",
+		"capabilities": []string{"desktop"},
+	})
+	if status != http.StatusOK {
+		t.Fatalf("register device = %d %v", status, registered)
+	}
+	device, _ := registered["device"].(map[string]any)
+	deviceID, _ := device["id"].(string)
+	credential, _ := registered["deviceCredential"].(string)
+
+	// The desktop dials the relay; a controller joins it, which is what enrolls
+	// the phone the report has to land on.
+	deviceURL := "ws" + strings.TrimPrefix(h.server.URL, "http") + "/v1/devices/" + deviceID + "/connect"
+	deviceHeader := http.Header{}
+	deviceHeader.Set("Authorization", "Bearer "+credential)
+	deviceConn, _, err := websocket.DefaultDialer.Dial(deviceURL, deviceHeader)
+	if err != nil {
+		t.Fatalf("device dial: %v", err)
+	}
+	defer deviceConn.Close()
+	if hello := readFrame(t, deviceConn); hello["type"] != "relay_hello" {
+		t.Fatalf("device hello = %v", hello)
+	}
+
+	status, granted := h.do(http.MethodPost, "/me/remote-grants", token, map[string]string{"targetDeviceId": deviceID})
+	if status != http.StatusOK {
+		t.Fatalf("grant = %d %v", status, granted)
+	}
+	grant, _ := granted["grant"].(map[string]any)
+	ticket, _ := grant["ticket"].(string)
+	controllerURL := "ws" + strings.TrimPrefix(h.server.URL, "http") + "/v1/sessions/connect"
+	dialer := websocket.Dialer{Subprotocols: []string{"reasonix.remote.v1", "reasonix.auth." + ticket}}
+	controllerConn, _, err := dialer.Dial(controllerURL, nil)
+	if err != nil {
+		t.Fatalf("controller dial: %v", err)
+	}
+	defer controllerConn.Close()
+	if frame := readFrame(t, deviceConn); frame["type"] != "controller_connected" {
+		t.Fatalf("expected the controller to connect, got %v", frame)
+	}
+
+	status, pushed := h.doDevice(http.MethodPost, "/host/push/notify", deviceID, credential,
+		map[string]any{"type": "approval", "count": 2})
+	if status != http.StatusOK {
+		t.Fatalf("notify = %d %v", status, pushed)
+	}
+	if delivered, _ := pushed["delivered"].(float64); delivered != 1 {
+		t.Fatalf("delivered = %v, want 1 (the one enrolled controller)", pushed["delivered"])
+	}
+
+	controllers, err := h.store.Controllers(1, deviceID, "active")
+	if err != nil {
+		t.Fatalf("list controllers: %v", err)
+	}
+	if len(controllers) != 1 {
+		t.Fatalf("controllers = %v, want the enrolled one", controllers)
+	}
+	report, err := h.store.PendingReport(1, deviceID, controllers[0].ID)
+	if err != nil {
+		t.Fatalf("pending report: %v", err)
+	}
+	if report == nil || report.Kind != "approval" || report.Count != 2 {
+		t.Fatalf("pending report = %v, want approval x2", report)
+	}
+
+	// The same kind again keeps the larger count; the row never queues two.
+	status, pushed = h.doDevice(http.MethodPost, "/host/push/notify", deviceID, credential,
+		map[string]any{"type": "approval", "count": 5})
+	if status != http.StatusOK {
+		t.Fatalf("second notify = %d %v", status, pushed)
+	}
+	report, err = h.store.PendingReport(1, deviceID, controllers[0].ID)
+	if err != nil {
+		t.Fatalf("pending report: %v", err)
+	}
+	if report == nil || report.Count != 5 {
+		t.Fatalf("pending report = %v, want count folded to 5", report)
+	}
+}
+
+// A device credential is a claim plus a proof, and a wrong proof is not this
+// owner's report to make.
+func TestNotifyRefusesAReportWithoutAValidDeviceCredential(t *testing.T) {
+	h := newHarness(t)
+	token := h.signIn()
+	status, registered := h.do(http.MethodPost, "/me/devices", token, map[string]any{
+		"name": "test-studio", "platform": "linux", "publicKey": "cHVibGljLWtleQ",
+		"capabilities": []string{"desktop"},
+	})
+	if status != http.StatusOK {
+		t.Fatalf("register device = %d %v", status, registered)
+	}
+	device, _ := registered["device"].(map[string]any)
+	deviceID, _ := device["id"].(string)
+
+	status, body := h.doDevice(http.MethodPost, "/host/push/notify", deviceID, "not-the-credential",
+		map[string]any{"type": "approval", "count": 1})
+	if status != http.StatusUnauthorized {
+		t.Fatalf("notify with a wrong credential = %d %v", status, body)
+	}
+
+	status, body = h.doDevice(http.MethodPost, "/host/push/notify", deviceID, "",
+		map[string]any{"type": "approval", "count": 1})
+	if status != http.StatusUnauthorized {
+		t.Fatalf("notify with no credential = %d %v", status, body)
 	}
 }
 

@@ -80,6 +80,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/devices/{id}/connect", s.relay.DeviceConnect)
 	mux.HandleFunc("GET /v1/sessions/connect", s.relay.ControllerConnect)
 
+	// ---- host (a Studio talking about its enrolled phones) --------------
+	mux.HandleFunc("POST /host/push/notify", s.notifyPhones)
+
 	return s.cors(s.logged(mux))
 }
 
@@ -88,6 +91,77 @@ func (s *Server) Handler() http.Handler {
 func (s *Server) Close() {}
 
 // ---- device sign-in ---------------------------------------------------
+
+// deviceAuth is the credential a registered Studio proves itself with when it
+// calls the host routes on its own behalf. It is not an account session: the
+// id in the header is a claim, the credential is the proof, and the credential
+// decides which device this is — the same rule the relay socket follows.
+func (s *Server) deviceAuth(req *http.Request) (store.Device, error) {
+	declared := strings.TrimSpace(req.Header.Get("x-reasonix-device-id"))
+	credential := strings.TrimSpace(req.Header.Get("x-reasonix-device-credential"))
+	if declared == "" || credential == "" {
+		return store.Device{}, store.ErrUnauthorized
+	}
+	device, err := s.store.DeviceByCredential(credential)
+	if err != nil {
+		return store.Device{}, err
+	}
+	if device.ID != declared {
+		return store.Device{}, store.ErrUnauthorized
+	}
+	return device, nil
+}
+
+// notificationKinds are the three occasions a desktop may report. The hosted
+// service accepted these and nothing else, so no conversation text has anywhere
+// to go; keeping the list closed keeps that true here.
+var notificationKinds = map[string]bool{"approval": true, "input": true, "error": true}
+
+// notifyPhones is `POST /host/push/notify`: a desktop saying that something is
+// waiting, as a kind and a count.
+//
+// The answer is the same {delivered, failed, removed} the kernel parses. Nothing
+// here reaches the phone directly — a self-hosted deployment has no push
+// service — so the report is recorded against each active controller and a
+// phone reads it when it next asks; see /host/controllers.
+func (s *Server) notifyPhones(w http.ResponseWriter, req *http.Request) {
+	device, err := s.deviceAuth(req)
+	if err != nil {
+		s.fail(w, http.StatusUnauthorized, "unauthorized", "A device credential is required.")
+		return
+	}
+	var in struct {
+		Type  string `json:"type"`
+		Count int    `json:"count"`
+	}
+	if err := decode(req, &in); err != nil {
+		s.fail(w, http.StatusBadRequest, "invalid_json", "Request body must be valid JSON.")
+		return
+	}
+	if !notificationKinds[in.Type] {
+		s.fail(w, http.StatusBadRequest, "invalid_kind", "A report is approval, input or error.")
+		return
+	}
+	if in.Count < 1 || in.Count > 99 {
+		s.fail(w, http.StatusBadRequest, "invalid_count", "A count is between 1 and 99.")
+		return
+	}
+	// The owner is the account the device belongs to; a self-hosted deployment
+	// has one, and a device outside it is not this owner's to report against.
+	_, userID, err := s.store.DeviceByID(device.ID)
+	if err != nil {
+		s.fail(w, http.StatusUnauthorized, "unauthorized", "A device credential is required.")
+		return
+	}
+	delivered, err := s.store.NotifyControllers(userID, device.ID, in.Type, in.Count)
+	if err != nil {
+		s.fail(w, http.StatusInternalServerError, "internal", "Could not record the report.")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"delivered": delivered, "failed": 0, "removed": 0,
+	})
+}
 
 // startDevice opens a sign-in. The answer is the RFC 8628 shape the kernel
 // already parses, with the verification links pointing at this deployment.

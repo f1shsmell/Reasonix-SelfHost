@@ -85,6 +85,33 @@ CREATE TABLE IF NOT EXISTS tickets (
 CREATE INDEX IF NOT EXISTS devices_by_user ON devices (user_id);
 CREATE INDEX IF NOT EXISTS grants_by_expiry ON device_grants (expires_at);
 CREATE INDEX IF NOT EXISTS tickets_by_expiry ON tickets (expires_at);
+
+-- A controller is a browser or a phone that reached a Studio through the relay.
+-- The hosted service kept one row per enrolled controller so a desktop could
+-- list them, answer a pending one, revoke one, and tell the enrolled ones that
+-- something is waiting. A self-hosted relay carried the sockets but kept no
+-- record, which is why /host/controllers and /host/push/notify had nothing to
+-- read. The row outlives the socket: a phone in a pocket is exactly the case
+-- the notification exists for.
+CREATE TABLE IF NOT EXISTS controllers (
+	id              TEXT PRIMARY KEY,
+	device_id       TEXT NOT NULL,
+	user_id         INTEGER NOT NULL,
+	name            TEXT NOT NULL DEFAULT '',
+	user_agent      TEXT NOT NULL DEFAULT '',
+	state           TEXT NOT NULL DEFAULT 'active',
+	created_at      TEXT NOT NULL,
+	last_seen_at    TEXT,
+	revoked_at      TEXT,
+	replace_id      TEXT,
+	last_kind       TEXT,
+	last_count      INTEGER NOT NULL DEFAULT 0,
+	notified_at     TEXT,
+	FOREIGN KEY (device_id) REFERENCES devices (id)
+);
+
+CREATE INDEX IF NOT EXISTS controllers_by_device ON controllers (device_id);
+CREATE INDEX IF NOT EXISTS controllers_by_user ON controllers (user_id);
 `
 
 // Store is the one handle on the database. One connection is deliberate: the
@@ -671,6 +698,291 @@ func (s *Store) Prune() error {
 	cutoff := time.Now().UTC().Format(time.RFC3339Nano)
 	_, err := s.db.Exec(`DELETE FROM device_grants WHERE expires_at < ?`, cutoff)
 	return err
+}
+
+// ---- controllers -----------------------------------------------------
+
+// Controller is one browser or phone that reached a Studio through the relay,
+// as that Studio sees it. It outlives the socket: a phone in a pocket is the
+// case the notification exists for, and there is no connection to ask then.
+type Controller struct {
+	ID         string
+	DeviceID   string
+	UserID     int64
+	Name       string
+	UserAgent  string
+	State      string
+	CreatedAt  string
+	LastSeenAt *string
+	RevokedAt  *string
+	ReplaceID  string
+}
+
+// Controller states. A controller that has never been answered is pending;
+// one the owner added is active; one the owner ended is revoked.
+const (
+	ControllerPending = "pending"
+	ControllerActive  = "active"
+	ControllerRevoked = "revoked"
+)
+
+// EnrollController records a controller that just authenticated at the relay.
+// The first sight of a controller makes it active: a self-hosted deployment has
+// one owner who just minted its ticket, which is the same approval the hosted
+// service asked for with an admin code. A row that already exists is only
+// refreshed, so repeated connections do not multiply the list.
+func (s *Store) EnrollController(deviceID string, userID int64, userAgent string) (Controller, error) {
+	userAgent = strings.TrimSpace(userAgent)
+	existing, found, err := s.controllerByDeviceAndAgent(deviceID, userAgent)
+	if err != nil {
+		return Controller{}, err
+	}
+	if found {
+		stamp := now()
+		if _, err := s.db.Exec(`UPDATE controllers SET last_seen_at = ? WHERE id = ?`, stamp, existing.ID); err != nil {
+			return Controller{}, err
+		}
+		existing.LastSeenAt = &stamp
+		return existing, nil
+	}
+	id, err := randomHex(16)
+	if err != nil {
+		return Controller{}, err
+	}
+	stamp := now()
+	_, err = s.db.Exec(`
+		INSERT INTO controllers (id, device_id, user_id, name, user_agent, state, created_at, last_seen_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		id, deviceID, userID, "", userAgent, ControllerActive, stamp, stamp,
+	)
+	if err != nil {
+		return Controller{}, err
+	}
+	return Controller{
+		ID: id, DeviceID: deviceID, UserID: userID, UserAgent: userAgent,
+		State: ControllerActive, CreatedAt: stamp, LastSeenAt: &stamp,
+	}, nil
+}
+
+// controllerByDeviceAndAgent finds the row one phone produced before, so a
+// reconnect refreshes it instead of enrolling the same phone again.
+func (s *Store) controllerByDeviceAndAgent(deviceID, userAgent string) (Controller, bool, error) {
+	row := s.db.QueryRow(`
+		SELECT id, device_id, user_id, name, user_agent, state, created_at, last_seen_at, revoked_at, replace_id
+		  FROM controllers WHERE device_id = ? AND user_agent = ? AND revoked_at IS NULL
+		 ORDER BY created_at LIMIT 1`, deviceID, userAgent)
+	out, err := scanController(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Controller{}, false, nil
+	}
+	if err != nil {
+		return Controller{}, false, err
+	}
+	return out, true, nil
+}
+
+// Controllers lists the controllers enrolled against one device, in the given
+// state ("all" or empty for every one).
+func (s *Store) Controllers(userID int64, deviceID, state string) ([]Controller, error) {
+	query := `SELECT id, device_id, user_id, name, user_agent, state, created_at, last_seen_at, revoked_at, replace_id
+	            FROM controllers WHERE user_id = ? AND device_id = ?`
+	args := []any{userID, deviceID}
+	switch strings.TrimSpace(state) {
+	case "", "all":
+	case ControllerPending, ControllerActive, ControllerRevoked:
+		query += ` AND state = ?`
+		args = append(args, strings.TrimSpace(state))
+	default:
+		return nil, ErrNotFound
+	}
+	query += ` ORDER BY created_at`
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Controller{}
+	for rows.Next() {
+		controller, err := scanController(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, controller)
+	}
+	return out, rows.Err()
+}
+
+// ControllerByID reads one controller of one device.
+func (s *Store) ControllerByID(userID int64, deviceID, id string) (Controller, error) {
+	row := s.db.QueryRow(`
+		SELECT id, device_id, user_id, name, user_agent, state, created_at, last_seen_at, revoked_at, replace_id
+		  FROM controllers WHERE user_id = ? AND device_id = ? AND id = ?`,
+		userID, deviceID, strings.TrimSpace(id))
+	out, err := scanController(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Controller{}, ErrNotFound
+	}
+	return out, err
+}
+
+// SetControllerState moves one controller to a state the owner chose. Replacing
+// names the active controller that gives way, and that one is revoked in the
+// same transaction: two active controllers for one phone would both be told
+// they are connected.
+func (s *Store) SetControllerState(userID int64, deviceID, id, state, replaceID string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	stamp := now()
+	if err := tx.QueryRow(`SELECT 1 FROM controllers WHERE user_id = ? AND device_id = ? AND id = ?`,
+		userID, deviceID, strings.TrimSpace(id)).Scan(new(int)); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	// Two shapes because a state change either sets or clears the revocation
+	// stamp; a mistake here is a controller that cannot be ended.
+	var execErr error
+	if state == ControllerRevoked {
+		_, execErr = tx.Exec(`UPDATE controllers SET state = ?, revoked_at = ?, notified_at = NULL, last_kind = NULL, last_count = 0
+		                        WHERE user_id = ? AND device_id = ? AND id = ?`,
+			state, stamp, userID, deviceID, strings.TrimSpace(id))
+	} else {
+		_, execErr = tx.Exec(`UPDATE controllers SET state = ?, revoked_at = NULL, notified_at = NULL, last_kind = NULL, last_count = 0
+		                        WHERE user_id = ? AND device_id = ? AND id = ?`,
+			state, userID, deviceID, strings.TrimSpace(id))
+	}
+	if execErr != nil {
+		return execErr
+	}
+	if state == ControllerActive && strings.TrimSpace(replaceID) != "" {
+		if _, err := tx.Exec(`UPDATE controllers SET state = ?, revoked_at = ? WHERE user_id = ? AND device_id = ? AND id = ?`,
+			ControllerRevoked, stamp, userID, deviceID, strings.TrimSpace(replaceID)); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// NotifyControllers records one report against every active controller of a
+// device, and answers how many took it.
+//
+// The report is a kind and a count — the three occasions the kernel names — so
+// nothing about a conversation reaches this table. An active controller that was
+// already told the same kind keeps the larger count instead of queueing a second
+// message: a phone that read one "3 waiting" does not need "1 waiting" next.
+func (s *Store) NotifyControllers(userID int64, deviceID, kind string, count int) (delivered int, err error) {
+	rows, err := s.db.Query(`
+		SELECT id FROM controllers
+		 WHERE user_id = ? AND device_id = ? AND state = ? AND revoked_at IS NULL`,
+		userID, deviceID, ControllerActive)
+	if err != nil {
+		return 0, err
+	}
+	ids := []string{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	stamp := now()
+	for _, id := range ids {
+		// Two statements, one meaning: a controller already waiting on this kind
+		// keeps the larger count, and one waiting on a different kind (or on
+		// nothing) is replaced by this report. Either way the row carries one
+		// pending occasion, never a queue.
+		if _, err := s.db.Exec(`
+			UPDATE controllers
+			   SET last_count = MAX(last_count, ?), notified_at = ?
+			 WHERE id = ? AND last_kind = ?`,
+			count, stamp, id, kind); err != nil {
+			return 0, err
+		}
+		if _, err := s.db.Exec(`
+			UPDATE controllers
+			   SET last_kind = ?, last_count = ?, notified_at = ?
+			 WHERE id = ? AND (last_kind IS NULL OR last_kind != ?)`,
+			kind, count, stamp, id, kind); err != nil {
+			return 0, err
+		}
+	}
+	return len(ids), nil
+}
+
+// ControllerReport is one controller's pending notification, or nil when it has
+// none. The app reads this instead of holding a socket open for a push: a
+// self-hosted deployment has no push service, and polling what is waiting is
+// the shape that needs none.
+type ControllerReport struct {
+	Kind      string
+	Count     int
+	NotifiedAt string
+}
+
+// PendingReport reads what is waiting for one active controller.
+func (s *Store) PendingReport(userID int64, deviceID, id string) (*ControllerReport, error) {
+	var (
+		kind     sql.NullString
+		count    int
+		notified sql.NullString
+	)
+	err := s.db.QueryRow(`
+		SELECT last_kind, last_count, notified_at FROM controllers
+		 WHERE user_id = ? AND device_id = ? AND id = ? AND state = ? AND revoked_at IS NULL`,
+		userID, deviceID, strings.TrimSpace(id), ControllerActive).Scan(&kind, &count, &notified)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !kind.Valid || !notified.Valid || count <= 0 {
+		return nil, nil
+	}
+	return &ControllerReport{Kind: kind.String, Count: count, NotifiedAt: notified.String}, nil
+}
+
+// ClearReport drops a controller's pending notification once it has been read.
+func (s *Store) ClearReport(userID int64, deviceID, id string) error {
+	_, err := s.db.Exec(`
+		UPDATE controllers SET last_kind = NULL, last_count = 0, notified_at = NULL
+		 WHERE user_id = ? AND device_id = ? AND id = ?`, userID, deviceID, strings.TrimSpace(id))
+	return err
+}
+
+func scanController(rows interface{ Scan(...any) error }) (Controller, error) {
+	var (
+		out       Controller
+		lastSeen  sql.NullString
+		revokedAt sql.NullString
+		replace   sql.NullString
+	)
+	err := rows.Scan(&out.ID, &out.DeviceID, &out.UserID, &out.Name, &out.UserAgent, &out.State,
+		&out.CreatedAt, &lastSeen, &revokedAt, &replace)
+	if err != nil {
+		return Controller{}, err
+	}
+	if lastSeen.Valid {
+		out.LastSeenAt = &lastSeen.String
+	}
+	if revokedAt.Valid {
+		out.RevokedAt = &revokedAt.String
+	}
+	if replace.Valid {
+		out.ReplaceID = replace.String
+	}
+	return out, nil
 }
 
 // ---- helpers ---------------------------------------------------------
