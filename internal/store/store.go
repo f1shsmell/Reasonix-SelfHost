@@ -110,8 +110,11 @@ CREATE TABLE IF NOT EXISTS controllers (
 	FOREIGN KEY (device_id) REFERENCES devices (id)
 );
 
-CREATE INDEX IF NOT EXISTS controllers_by_device ON controllers (device_id);
-CREATE INDEX IF NOT EXISTS controllers_by_user ON controllers (user_id);
+-- The filters this table is actually read with:
+--   Controllers(userID, deviceID, state) — state last, because "all" drops it.
+--   controllerByDeviceAndAgent       — and revoked_at, which it also filters.
+CREATE INDEX IF NOT EXISTS controllers_by_device_state ON controllers (user_id, device_id, state);
+CREATE INDEX IF NOT EXISTS controllers_by_phone ON controllers (device_id, user_agent, revoked_at);
 `
 
 // Store is the one handle on the database. One connection is deliberate: the
@@ -546,6 +549,30 @@ func (s *Store) DeviceByCredential(credential string) (Device, error) {
 	return device, nil
 }
 
+// DeviceByCredentialWithOwner is DeviceByCredential plus the account the device
+// belongs to. The host routes need both, and reading the owner in the same
+// statement keeps a store failure a store failure instead of flattening it into
+// a 401 further up.
+func (s *Store) DeviceByCredentialWithOwner(credential string) (Device, int64, error) {
+	if strings.TrimSpace(credential) == "" {
+		return Device{}, 0, ErrUnauthorized
+	}
+	row := s.db.QueryRow(`
+		SELECT id, name, platform, public_key, capabilities, gateway_id, last_seen_at, revoked_at, user_id
+		  FROM devices WHERE credential_hash = ?`, hashCode(credential))
+	device, userID, err := scanDeviceWithOwner(row)
+	if errors.Is(err, ErrNotFound) {
+		return Device{}, 0, ErrUnauthorized
+	}
+	if err != nil {
+		return Device{}, 0, err
+	}
+	if device.RevokedAt != nil {
+		return Device{}, 0, ErrUnauthorized
+	}
+	return device, userID, nil
+}
+
 // TouchDevice records that a device's relay link came up.
 func (s *Store) TouchDevice(id string) {
 	_, _ = s.db.Exec(`UPDATE devices SET last_seen_at = ? WHERE id = ?`, now(), id)
@@ -696,7 +723,14 @@ func (s *Store) SpendTicket(ticket string) (Ticket, error) {
 // Prune drops rows nothing can use any more.
 func (s *Store) Prune() error {
 	cutoff := time.Now().UTC().Format(time.RFC3339Nano)
-	_, err := s.db.Exec(`DELETE FROM device_grants WHERE expires_at < ?`, cutoff)
+	if _, err := s.db.Exec(`DELETE FROM device_grants WHERE expires_at < ?`, cutoff); err != nil {
+		return err
+	}
+	// A revoked controller is history, not state: nothing reads it once it is
+	// over, and leaving it makes every reconnect look like a new phone in the
+	// table it no longer shows up in.
+	_, err := s.db.Exec(`DELETE FROM controllers WHERE state = ? AND revoked_at IS NOT NULL AND revoked_at < ?`,
+		ControllerRevoked, cutoff)
 	return err
 }
 
@@ -762,6 +796,15 @@ func (s *Store) EnrollController(deviceID string, userID int64, userAgent string
 		ID: id, DeviceID: deviceID, UserID: userID, UserAgent: userAgent,
 		State: ControllerActive, CreatedAt: stamp, LastSeenAt: &stamp,
 	}, nil
+}
+
+// RemoveUnseenController drops the row a dial enrolled for a device that went
+// offline between the first read and the upgrade. Without it a phone that never
+// got a socket stays counted in NotifyControllers, and the row that follows the
+// reconnect is a second one for the same phone.
+func (s *Store) RemoveUnseenController(deviceID, userAgent string) {
+	_, _ = s.db.Exec(`DELETE FROM controllers WHERE device_id = ? AND user_agent = ?`,
+		deviceID, strings.TrimSpace(userAgent))
 }
 
 // controllerByDeviceAndAgent finds the row one phone produced before, so a
@@ -897,25 +940,28 @@ func (s *Store) NotifyControllers(userID int64, deviceID, kind string, count int
 		return 0, err
 	}
 	stamp := now()
+	// One statement per controller, inside one transaction. Two separate
+	// updates meant a report that changed the kind could be interleaved with
+	// the opposite order and lose one of them; the CASE does the merge the two
+	// statements were trying to express, atomically.
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
 	for _, id := range ids {
-		// Two statements, one meaning: a controller already waiting on this kind
-		// keeps the larger count, and one waiting on a different kind (or on
-		// nothing) is replaced by this report. Either way the row carries one
-		// pending occasion, never a queue.
-		if _, err := s.db.Exec(`
+		if _, err := tx.Exec(`
 			UPDATE controllers
-			   SET last_count = MAX(last_count, ?), notified_at = ?
-			 WHERE id = ? AND last_kind = ?`,
-			count, stamp, id, kind); err != nil {
+			   SET last_kind  = ?,
+			       last_count = CASE WHEN last_kind = ? THEN MAX(last_count, ?) ELSE ? END,
+			       notified_at = ?
+			 WHERE id = ?`,
+			kind, kind, count, count, stamp, id); err != nil {
 			return 0, err
 		}
-		if _, err := s.db.Exec(`
-			UPDATE controllers
-			   SET last_kind = ?, last_count = ?, notified_at = ?
-			 WHERE id = ? AND (last_kind IS NULL OR last_kind != ?)`,
-			kind, count, stamp, id, kind); err != nil {
-			return 0, err
-		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
 	}
 	return len(ids), nil
 }

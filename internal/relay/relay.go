@@ -216,21 +216,21 @@ func (r *Relay) ControllerConnect(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	// Enroll before the upgrade so a failure here is still an answer on the wire
+	// rather than a socket that opens and closes with no reason. The row is keyed
+	// by the phone's user agent: the relay has no other stable name for "the same
+	// phone again".
+	if _, err := r.store.EnrollController(grant.DeviceID, grant.UserID, req.UserAgent()); err != nil {
+		http.Error(w, "cannot enroll the controller", http.StatusInternalServerError)
+		return
+	}
+
 	conn, err := r.upgrader.Upgrade(w, req, nil)
 	if err != nil {
 		return
 	}
 	_ = offered
 	conn.SetReadLimit(maxFrame)
-
-	// A controller that proved its ticket is enrolled before it speaks, so a
-	// report the desktop sends a moment later has a row to land on. The row is
-	// keyed by the phone's user agent for the same reason a browser session is:
-	// the relay has no other stable name for "the same phone again".
-	if _, err := r.store.EnrollController(grant.DeviceID, grant.UserID, req.UserAgent()); err != nil {
-		_ = conn.Close()
-		return
-	}
 
 	id := connectionID()
 	link := &controllerLink{conn: conn, device: grant.DeviceID}
@@ -242,6 +242,10 @@ func (r *Relay) ControllerConnect(w http.ResponseWriter, req *http.Request) {
 	}
 	r.mu.Unlock()
 	if current == nil {
+		// The device left between the first read and the upgrade. The row this
+		// dial enrolled must not survive it: a notify would count a phone that
+		// has no socket at all.
+		r.store.RemoveUnseenController(grant.DeviceID, req.UserAgent())
 		_ = conn.Close()
 		return
 	}

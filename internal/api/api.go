@@ -121,12 +121,16 @@ func (s *Server) deviceAuth(req *http.Request) (store.Device, error) {
 // host routes scope every read and every change to one owner, and a self-hosted
 // deployment has exactly one, so the pair is what they need.
 func (s *Server) deviceAuthWithOwner(req *http.Request) (store.Device, int64, error) {
-	device, err := s.deviceAuth(req)
+	declared := strings.TrimSpace(req.Header.Get("x-reasonix-device-id"))
+	credential := strings.TrimSpace(req.Header.Get("x-reasonix-device-credential"))
+	if declared == "" || credential == "" {
+		return store.Device{}, 0, store.ErrUnauthorized
+	}
+	device, userID, err := s.store.DeviceByCredentialWithOwner(credential)
 	if err != nil {
 		return store.Device{}, 0, err
 	}
-	_, userID, err := s.store.DeviceByID(device.ID)
-	if err != nil {
+	if device.ID != declared {
 		return store.Device{}, 0, store.ErrUnauthorized
 	}
 	return device, userID, nil
@@ -214,14 +218,27 @@ func controllerWire(controller store.Controller) map[string]any {
 // service used it to tell two phones apart in a list; the same three families
 // cover what reaches a self-hosted relay.
 func uaClass(userAgent string) string {
+	// The four values the window already knows, from port/phone_device.ts:
+	// a phone in the app's WebView is told apart from the same phone in a
+	// browser, because only the second one is a "Web Studio" session.
 	lower := strings.ToLower(userAgent)
 	switch {
 	case lower == "":
 		return ""
+	case strings.Contains(lower, "iphone"), strings.Contains(lower, "ipad"), strings.Contains(lower, "ipod"):
+		if strings.Contains(lower, "safari") &&
+			!strings.Contains(lower, "fxios") && !strings.Contains(lower, "crios") && !strings.Contains(lower, "edgios") {
+			return "ios-safari"
+		}
+		return "ios-webview"
 	case strings.Contains(lower, "android"):
-		return "android"
-	case strings.Contains(lower, "iphone"), strings.Contains(lower, "ipad"):
-		return "ios"
+		// Go's transport and Android's WebView both spell the marker as
+		// `; wv`, and the closing paren only appears when another field
+		// follows it — matching on `; wv)` alone missed half of them.
+		if strings.Contains(lower, "; wv") {
+			return "android-webview"
+		}
+		return "android-chrome"
 	case strings.Contains(lower, "mozilla"), strings.Contains(lower, "chrome"), strings.Contains(lower, "safari"):
 		return "browser"
 	}
@@ -329,12 +346,12 @@ func (s *Server) readControllerReport(w http.ResponseWriter, req *http.Request) 
 		return
 	}
 	report, err := s.store.PendingReport(userID, device.ID, req.PathValue("id"))
-	if errors.Is(err, store.ErrNotFound) {
-		s.fail(w, http.StatusNotFound, "controller_not_found", "No such controller on this desktop.")
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		s.fail(w, http.StatusInternalServerError, "internal", "Could not read the report.")
 		return
 	}
-	if err != nil {
-		s.fail(w, http.StatusInternalServerError, "internal", "Could not read the report.")
+	if errors.Is(err, store.ErrNotFound) {
+		s.fail(w, http.StatusNotFound, "controller_not_found", "No such controller on this desktop.")
 		return
 	}
 	if report == nil {
