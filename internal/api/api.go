@@ -82,6 +82,11 @@ func (s *Server) Handler() http.Handler {
 
 	// ---- host (a Studio talking about its enrolled phones) --------------
 	mux.HandleFunc("POST /host/push/notify", s.notifyPhones)
+	mux.HandleFunc("GET /host/controllers", s.listControllers)
+	mux.HandleFunc("POST /host/controllers/{id}/resolve", s.resolveController)
+	mux.HandleFunc("POST /host/controllers/{id}/revoke", s.revokeController)
+	mux.HandleFunc("GET /host/controllers/{id}/report", s.readControllerReport)
+	mux.HandleFunc("POST /host/controllers/{id}/seen", s.clearControllerReport)
 
 	return s.cors(s.logged(mux))
 }
@@ -110,6 +115,21 @@ func (s *Server) deviceAuth(req *http.Request) (store.Device, error) {
 		return store.Device{}, store.ErrUnauthorized
 	}
 	return device, nil
+}
+
+// deviceAuthWithOwner is deviceAuth plus the account the device belongs to. The
+// host routes scope every read and every change to one owner, and a self-hosted
+// deployment has exactly one, so the pair is what they need.
+func (s *Server) deviceAuthWithOwner(req *http.Request) (store.Device, int64, error) {
+	device, err := s.deviceAuth(req)
+	if err != nil {
+		return store.Device{}, 0, err
+	}
+	_, userID, err := s.store.DeviceByID(device.ID)
+	if err != nil {
+		return store.Device{}, 0, store.ErrUnauthorized
+	}
+	return device, userID, nil
 }
 
 // notificationKinds are the three occasions a desktop may report. The hosted
@@ -161,6 +181,184 @@ func (s *Server) notifyPhones(w http.ResponseWriter, req *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"delivered": delivered, "failed": 0, "removed": 0,
 	})
+}
+
+// controllerWire is the shape the kernel's Phone reads. Fields a self-hosted
+// deployment has no opinion about are answered with the honest empty value
+// rather than omitted: a frontend that renders a row expects the key.
+func controllerWire(controller store.Controller) map[string]any {
+	lastSeen := controller.CreatedAt
+	if controller.LastSeenAt != nil {
+		lastSeen = *controller.LastSeenAt
+	}
+	out := map[string]any{
+		"id":            controller.ID,
+		"name":          controller.Name,
+		"nameSource":    "",
+		"state":         controller.State,
+		"uaClass":       uaClass(controller.UserAgent),
+		"createdAt":     controller.CreatedAt,
+		"lastSeenAt":    lastSeen,
+		"keyThumbprint": "",
+	}
+	if controller.RevokedAt != nil {
+		out["revokedAt"] = *controller.RevokedAt
+	}
+	if controller.ReplaceID != "" {
+		out["replaceCandidate"] = controller.ReplaceID
+	}
+	return out
+}
+
+// uaClass is the coarse family a controller's user agent names. The hosted
+// service used it to tell two phones apart in a list; the same three families
+// cover what reaches a self-hosted relay.
+func uaClass(userAgent string) string {
+	lower := strings.ToLower(userAgent)
+	switch {
+	case lower == "":
+		return ""
+	case strings.Contains(lower, "android"):
+		return "android"
+	case strings.Contains(lower, "iphone"), strings.Contains(lower, "ipad"):
+		return "ios"
+	case strings.Contains(lower, "mozilla"), strings.Contains(lower, "chrome"), strings.Contains(lower, "safari"):
+		return "browser"
+	}
+	return "other"
+}
+
+// listControllers is `GET /host/controllers?state=`: the phones enrolled
+// against this desktop, which is what the window draws under "设备".
+func (s *Server) listControllers(w http.ResponseWriter, req *http.Request) {
+	device, userID, err := s.deviceAuthWithOwner(req)
+	if err != nil {
+		s.fail(w, http.StatusUnauthorized, "unauthorized", "A device credential is required.")
+		return
+	}
+	state := req.URL.Query().Get("state")
+	controllers, err := s.store.Controllers(userID, device.ID, state)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			s.fail(w, http.StatusBadRequest, "invalid_state", "A state is pending, active, revoked or all.")
+			return
+		}
+		s.fail(w, http.StatusInternalServerError, "internal", "Could not read the controllers.")
+		return
+	}
+	wire := make([]map[string]any, 0, len(controllers))
+	for _, controller := range controllers {
+		wire = append(wire, controllerWire(controller))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"controllers": wire})
+}
+
+// resolveController is `POST /host/controllers/{id}/resolve`: the owner's answer
+// to a waiting phone. `add` makes it active, `reject` ends it, and `replace`
+// activates it while ending the one it names — two active copies of one phone
+// would both be told they are connected.
+func (s *Server) resolveController(w http.ResponseWriter, req *http.Request) {
+	device, userID, err := s.deviceAuthWithOwner(req)
+	if err != nil {
+		s.fail(w, http.StatusUnauthorized, "unauthorized", "A device credential is required.")
+		return
+	}
+	var in struct {
+		Action    string `json:"action"`
+		ReplaceID string `json:"replaceId"`
+	}
+	if err := decode(req, &in); err != nil {
+		s.fail(w, http.StatusBadRequest, "invalid_json", "Request body must be valid JSON.")
+		return
+	}
+	var state string
+	switch in.Action {
+	case "add":
+		state = store.ControllerActive
+	case "reject":
+		state = store.ControllerRevoked
+	case "replace":
+		if strings.TrimSpace(in.ReplaceID) == "" {
+			s.fail(w, http.StatusBadRequest, "missing_replace_id", "A replacement names the controller it replaces.")
+			return
+		}
+		state = store.ControllerActive
+	default:
+		s.fail(w, http.StatusBadRequest, "invalid_action", "An action is add, replace or reject.")
+		return
+	}
+	err = s.store.SetControllerState(userID, device.ID, req.PathValue("id"), state, in.ReplaceID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			s.fail(w, http.StatusNotFound, "controller_not_found", "No such controller on this desktop.")
+			return
+		}
+		s.fail(w, http.StatusInternalServerError, "internal", "Could not answer the controller.")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// revokeController is `POST /host/controllers/{id}/revoke`. It cannot be undone:
+// the phone starts again with a fresh ticket.
+func (s *Server) revokeController(w http.ResponseWriter, req *http.Request) {
+	device, userID, err := s.deviceAuthWithOwner(req)
+	if err != nil {
+		s.fail(w, http.StatusUnauthorized, "unauthorized", "A device credential is required.")
+		return
+	}
+	err = s.store.SetControllerState(userID, device.ID, req.PathValue("id"), store.ControllerRevoked, "")
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			s.fail(w, http.StatusNotFound, "controller_not_found", "No such controller on this desktop.")
+			return
+		}
+		s.fail(w, http.StatusInternalServerError, "internal", "Could not revoke the controller.")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// readControllerReport is `GET /host/controllers/{id}/report`: what is waiting
+// for this phone, if anything. A phone polls this on its own timer, because a
+// self-hosted deployment has no push service to reach it with.
+func (s *Server) readControllerReport(w http.ResponseWriter, req *http.Request) {
+	device, userID, err := s.deviceAuthWithOwner(req)
+	if err != nil {
+		s.fail(w, http.StatusUnauthorized, "unauthorized", "A device credential is required.")
+		return
+	}
+	report, err := s.store.PendingReport(userID, device.ID, req.PathValue("id"))
+	if errors.Is(err, store.ErrNotFound) {
+		s.fail(w, http.StatusNotFound, "controller_not_found", "No such controller on this desktop.")
+		return
+	}
+	if err != nil {
+		s.fail(w, http.StatusInternalServerError, "internal", "Could not read the report.")
+		return
+	}
+	if report == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"pending": false})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"pending": true, "type": report.Kind, "count": report.Count, "notifiedAt": report.NotifiedAt,
+	})
+}
+
+// clearControllerReport is `POST /host/controllers/{id}/seen`: the phone has
+// read what was waiting, so the next poll answers nothing.
+func (s *Server) clearControllerReport(w http.ResponseWriter, req *http.Request) {
+	device, userID, err := s.deviceAuthWithOwner(req)
+	if err != nil {
+		s.fail(w, http.StatusUnauthorized, "unauthorized", "A device credential is required.")
+		return
+	}
+	if err := s.store.ClearReport(userID, device.ID, req.PathValue("id")); err != nil {
+		s.fail(w, http.StatusInternalServerError, "internal", "Could not clear the report.")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 // startDevice opens a sign-in. The answer is the RFC 8628 shape the kernel

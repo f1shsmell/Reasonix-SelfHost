@@ -455,6 +455,182 @@ func TestCorsOnlyAnswersConfiguredOrigins(t *testing.T) {
 	}
 }
 
+// The list, the answer and the revoke are the three things a window does with
+// an enrolled phone. A self-hosted deployment records a controller when it
+// spends a ticket, so the row exists before the first question is asked.
+func TestControllersListAnswerAndRevoke(t *testing.T) {
+	h := newHarness(t)
+	token := h.signIn()
+
+	status, registered := h.do(http.MethodPost, "/me/devices", token, map[string]any{
+		"name": "test-studio", "platform": "linux", "publicKey": "cHVibGljLWtleQ",
+		"capabilities": []string{"desktop"},
+	})
+	if status != http.StatusOK {
+		t.Fatalf("register device = %d %v", status, registered)
+	}
+	device, _ := registered["device"].(map[string]any)
+	deviceID, _ := device["id"].(string)
+	credential, _ := registered["deviceCredential"].(string)
+
+	// A controller joins, which is the only way a row appears.
+	deviceURL := "ws" + strings.TrimPrefix(h.server.URL, "http") + "/v1/devices/" + deviceID + "/connect"
+	deviceHeader := http.Header{}
+	deviceHeader.Set("Authorization", "Bearer "+credential)
+	deviceConn, _, err := websocket.DefaultDialer.Dial(deviceURL, deviceHeader)
+	if err != nil {
+		t.Fatalf("device dial: %v", err)
+	}
+	defer deviceConn.Close()
+	_ = readFrame(t, deviceConn)
+
+	status, granted := h.do(http.MethodPost, "/me/remote-grants", token, map[string]string{"targetDeviceId": deviceID})
+	if status != http.StatusOK {
+		t.Fatalf("grant = %d %v", status, granted)
+	}
+	grant, _ := granted["grant"].(map[string]any)
+	ticket, _ := grant["ticket"].(string)
+	controllerURL := "ws" + strings.TrimPrefix(h.server.URL, "http") + "/v1/sessions/connect"
+	dialer := websocket.Dialer{Subprotocols: []string{"reasonix.remote.v1", "reasonix.auth." + ticket}}
+	controllerConn, _, err := dialer.Dial(controllerURL, nil)
+	if err != nil {
+		t.Fatalf("controller dial: %v", err)
+	}
+	defer controllerConn.Close()
+	_ = readFrame(t, deviceConn)
+
+	status, listed := h.doDevice(http.MethodGet, "/host/controllers?state=active", deviceID, credential, nil)
+	if status != http.StatusOK {
+		t.Fatalf("list controllers = %d %v", status, listed)
+	}
+	controllers, _ := listed["controllers"].([]any)
+	if len(controllers) != 1 {
+		t.Fatalf("controllers = %v, want the one that joined", listed["controllers"])
+	}
+	row, _ := controllers[0].(map[string]any)
+	controllerID, _ := row["id"].(string)
+	if controllerID == "" || row["state"] != "active" {
+		t.Fatalf("controller row = %v", row)
+	}
+
+	// An unknown state is a caller mistake, not an empty answer.
+	status, body := h.doDevice(http.MethodGet, "/host/controllers?state=bogus", deviceID, credential, nil)
+	if status != http.StatusBadRequest {
+		t.Fatalf("list with a bogus state = %d %v", status, body)
+	}
+
+	// resolve: replace needs the controller it replaces.
+	status, body = h.doDevice(http.MethodPost, "/host/controllers/"+controllerID+"/resolve", deviceID, credential,
+		map[string]any{"action": "replace"})
+	if status != http.StatusBadRequest {
+		t.Fatalf("replace without replaceId = %d %v", status, body)
+	}
+	status, body = h.doDevice(http.MethodPost, "/host/controllers/"+controllerID+"/resolve", deviceID, credential,
+		map[string]any{"action": "bogus"})
+	if status != http.StatusBadRequest {
+		t.Fatalf("resolve with a bogus action = %d %v", status, body)
+	}
+	status, body = h.doDevice(http.MethodPost, "/host/controllers/"+controllerID+"/resolve", deviceID, credential,
+		map[string]any{"action": "add"})
+	if status != http.StatusOK {
+		t.Fatalf("resolve add = %d %v", status, body)
+	}
+
+	// revoke ends it, and it cannot be undone by a list that still asks for it.
+	status, body = h.doDevice(http.MethodPost, "/host/controllers/"+controllerID+"/revoke", deviceID, credential, map[string]any{})
+	if status != http.StatusOK {
+		t.Fatalf("revoke = %d %v", status, body)
+	}
+	status, listed = h.doDevice(http.MethodGet, "/host/controllers?state=active", deviceID, credential, nil)
+	if status != http.StatusOK {
+		t.Fatalf("list after revoke = %d", status)
+	}
+	if active, _ := listed["controllers"].([]any); len(active) != 0 {
+		t.Fatalf("a revoked controller is still active: %v", listed["controllers"])
+	}
+
+	// A controller this desktop does not own is not found, not answered.
+	status, body = h.doDevice(http.MethodPost, "/host/controllers/nope/revoke", deviceID, credential, map[string]any{})
+	if status != http.StatusNotFound {
+		t.Fatalf("revoke of an unknown controller = %d %v", status, body)
+	}
+}
+
+// A report is read once: poll while something is waiting, then say it was seen
+// and the next poll answers nothing.
+func TestAReportIsReadOnceAndThenCleared(t *testing.T) {
+	h := newHarness(t)
+	token := h.signIn()
+
+	status, registered := h.do(http.MethodPost, "/me/devices", token, map[string]any{
+		"name": "test-studio", "platform": "linux", "publicKey": "cHVibGljLWtleQ",
+		"capabilities": []string{"desktop"},
+	})
+	if status != http.StatusOK {
+		t.Fatalf("register device = %d %v", status, registered)
+	}
+	device, _ := registered["device"].(map[string]any)
+	deviceID, _ := device["id"].(string)
+	credential, _ := registered["deviceCredential"].(string)
+
+	deviceURL := "ws" + strings.TrimPrefix(h.server.URL, "http") + "/v1/devices/" + deviceID + "/connect"
+	deviceHeader := http.Header{}
+	deviceHeader.Set("Authorization", "Bearer "+credential)
+	deviceConn, _, err := websocket.DefaultDialer.Dial(deviceURL, deviceHeader)
+	if err != nil {
+		t.Fatalf("device dial: %v", err)
+	}
+	defer deviceConn.Close()
+	_ = readFrame(t, deviceConn)
+
+	status, granted := h.do(http.MethodPost, "/me/remote-grants", token, map[string]string{"targetDeviceId": deviceID})
+	if status != http.StatusOK {
+		t.Fatalf("grant = %d %v", status, granted)
+	}
+	grant, _ := granted["grant"].(map[string]any)
+	ticket, _ := grant["ticket"].(string)
+	controllerURL := "ws" + strings.TrimPrefix(h.server.URL, "http") + "/v1/sessions/connect"
+	dialer := websocket.Dialer{Subprotocols: []string{"reasonix.remote.v1", "reasonix.auth." + ticket}}
+	controllerConn, _, err := dialer.Dial(controllerURL, nil)
+	if err != nil {
+		t.Fatalf("controller dial: %v", err)
+	}
+	defer controllerConn.Close()
+	_ = readFrame(t, deviceConn)
+
+	_, listed := h.doDevice(http.MethodGet, "/host/controllers?state=active", deviceID, credential, nil)
+	controllers, _ := listed["controllers"].([]any)
+	row, _ := controllers[0].(map[string]any)
+	controllerID, _ := row["id"].(string)
+
+	// Nothing is waiting yet.
+	status, report := h.doDevice(http.MethodGet, "/host/controllers/"+controllerID+"/report", deviceID, credential, nil)
+	if status != http.StatusOK || report["pending"] != false {
+		t.Fatalf("report before any notification = %d %v", status, report)
+	}
+
+	if status, body := h.doDevice(http.MethodPost, "/host/push/notify", deviceID, credential,
+		map[string]any{"type": "input", "count": 3}); status != http.StatusOK {
+		t.Fatalf("notify = %d %v", status, body)
+	}
+	status, report = h.doDevice(http.MethodGet, "/host/controllers/"+controllerID+"/report", deviceID, credential, nil)
+	if status != http.StatusOK || report["pending"] != true || report["type"] != "input" {
+		t.Fatalf("report = %d %v", status, report)
+	}
+	if count, _ := report["count"].(float64); count != 3 {
+		t.Fatalf("report count = %v", report["count"])
+	}
+
+	if status, body := h.doDevice(http.MethodPost, "/host/controllers/"+controllerID+"/seen", deviceID, credential,
+		map[string]any{}); status != http.StatusOK {
+		t.Fatalf("seen = %d %v", status, body)
+	}
+	status, report = h.doDevice(http.MethodGet, "/host/controllers/"+controllerID+"/report", deviceID, credential, nil)
+	if status != http.StatusOK || report["pending"] != false {
+		t.Fatalf("report after seen = %d %v", status, report)
+	}
+}
+
 func TestApprovalPageShowsTheCode(t *testing.T) {
 	h := newHarness(t)
 	_, grant := h.do(http.MethodPost, "/device/start", "", nil)
