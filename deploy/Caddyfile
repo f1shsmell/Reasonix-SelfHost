@@ -2,6 +2,11 @@
 # loopback address the service listens on; the service itself never sees a
 # certificate and never speaks plain HTTP to a client.
 #
+# This file is for a Caddy on the same machine as the service (the systemd
+# guide). The Docker guide runs Caddy in its own container, where 127.0.0.1 is
+# Caddy itself — there, replace both `127.0.0.1:8790` below with
+# `selfhost:8790`, the service's name on the compose network.
+#
 # Replace the two hostnames and the ACME email, then run `caddy run`.
 {
 	email you@example.com

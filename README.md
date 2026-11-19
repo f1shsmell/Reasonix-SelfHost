@@ -142,12 +142,29 @@ host" — it turns CORS off entirely. Fill it in.
 
 ### 4. Write the Caddyfile
 
-The repository ships a generic one. Copy it, then set your own names:
+Caddy runs in its own container here, so it cannot reach the service on
+`127.0.0.1` — that address is Caddy itself. It reaches the service by its
+compose service name instead, and that is the one line that differs from the
+generic file in `deploy/Caddyfile`. Write the whole thing rather than copying:
 
 ```bash
 mkdir -p /srv/reasonix-selfhost/caddy/{data,config}
-cp /srv/reasonix-selfhost/app/deploy/Caddyfile \
-   /srv/reasonix-selfhost/caddy/Caddyfile
+cat > /srv/reasonix-selfhost/caddy/Caddyfile <<'EOF'
+{
+	email you@example.com
+}
+
+id.example.com {
+	encode zstd gzip
+	reverse_proxy selfhost:8790
+}
+
+relay.example.com {
+	reverse_proxy selfhost:8790 {
+		flush_interval -1
+	}
+}
+EOF
 $EDITOR /srv/reasonix-selfhost/caddy/Caddyfile
 ```
 
@@ -157,7 +174,7 @@ Three things to change in it, and nothing else:
 - `id.example.com {` → your account-service hostname;
 - `relay.example.com {` → your relay hostname.
 
-Then confirm exactly three changed lines and no leftover placeholder:
+Then confirm no placeholder survived:
 
 ```bash
 grep -nE 'example\.com' /srv/reasonix-selfhost/caddy/Caddyfile
@@ -167,7 +184,9 @@ Expect **no output**. If any line prints, it is still a placeholder and Caddy
 will try to obtain a certificate for a domain you do not own.
 
 The relay block carries `flush_interval -1`; keep it — an idle WebSocket is
-normal there, and buffering it breaks the connection.
+normal there, and buffering it breaks the connection. Both blocks must name
+`selfhost:8790`: swapping that for `127.0.0.1` is the single mistake that makes
+every request return 502 while the logs look otherwise healthy.
 
 ### 5. Write the compose file
 
@@ -175,7 +194,15 @@ normal there, and buffering it breaks the connection.
 # /srv/reasonix-selfhost/docker-compose.yml
 services:
   selfhost:
-    build: ./app
+    build:
+      context: ./app
+      dockerfile: deploy/Dockerfile
+      args:
+        # Module downloads inside the build. Go's own proxy is unreachable from
+        # many networks; goproxy.cn is the mirror most Chinese hosts can reach.
+        # Outside that situation, delete this `args:` block and the Dockerfile
+        # default applies instead.
+        GOPROXY: https://goproxy.cn,direct
     image: reasonix-selfhost:latest
     restart: unless-stopped
     env_file: ./selfhost.env

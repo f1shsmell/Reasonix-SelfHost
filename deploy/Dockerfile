@@ -5,6 +5,11 @@
 # so there is no cgo and no libc to match.
 FROM golang:1.27-alpine AS build
 WORKDIR /src
+# Module downloads go through the proxy the build is given. The default is Go's
+# own; a build on a network that cannot reach it passes its own mirror — see
+# the compose file in the README for the build-arg line.
+ARG GOPROXY=https://proxy.golang.org,direct
+ENV GOPROXY=${GOPROXY}
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .

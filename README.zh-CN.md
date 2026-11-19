@@ -125,12 +125,28 @@ chmod 600 /srv/reasonix-selfhost/selfhost.env
 
 ### 4. 写 Caddyfile
 
-仓库里带的是一份通用的。复制过去，再改成你自己的名字：
+这里 Caddy 跑在自己的容器里，所以它够不到 `127.0.0.1` 上的服务——那个地址是 Caddy
+自己。它改按 compose 的服务名找服务，这也是它和 `deploy/Caddyfile` 里那份通用文件
+唯一不同的一行。别复制，直接把整份写出来：
 
 ```bash
 mkdir -p /srv/reasonix-selfhost/caddy/{data,config}
-cp /srv/reasonix-selfhost/app/deploy/Caddyfile \
-   /srv/reasonix-selfhost/caddy/Caddyfile
+cat > /srv/reasonix-selfhost/caddy/Caddyfile <<'EOF'
+{
+	email you@example.com
+}
+
+id.example.com {
+	encode zstd gzip
+	reverse_proxy selfhost:8790
+}
+
+relay.example.com {
+	reverse_proxy selfhost:8790 {
+		flush_interval -1
+	}
+}
+EOF
 $EDITOR /srv/reasonix-selfhost/caddy/Caddyfile
 ```
 
@@ -150,7 +166,8 @@ grep -nE 'example\.com' /srv/reasonix-selfhost/caddy/Caddyfile
 域名申请证书。
 
 中继那段带着 `flush_interval -1`，保留它——那里的 WebSocket 空闲是正常的，
-对它做缓冲会断连接。
+对它做缓冲会断连接。两个块都必须写 `selfhost:8790`：把它换成 `127.0.0.1` 正是
+那个让每个请求都返回 502、而日志看起来一切正常的错误。
 
 ### 5. 写 compose 文件
 
@@ -158,7 +175,14 @@ grep -nE 'example\.com' /srv/reasonix-selfhost/caddy/Caddyfile
 # /srv/reasonix-selfhost/docker-compose.yml
 services:
   selfhost:
-    build: ./app
+    build:
+      context: ./app
+      dockerfile: deploy/Dockerfile
+      args:
+        # 构建时的模块下载。Go 官方代理在很多网络下连不上；goproxy.cn 是国内
+        # 大多数机器能访问的镜像。不在这种情况，把整个 `args:` 块删掉，
+        # Dockerfile 里的默认值会生效。
+        GOPROXY: https://goproxy.cn,direct
     image: reasonix-selfhost:latest
     restart: unless-stopped
     env_file: ./selfhost.env
