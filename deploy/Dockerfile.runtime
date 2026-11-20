@@ -1,0 +1,27 @@
+# Runtime-only image: the binary is built elsewhere and copied in.
+#
+# `deploy/Dockerfile` builds from source, which needs the whole Go toolchain and
+# peaks at 1.5-2 GB of RAM. That is the right file for CI and for any host with
+# room to spare. This one is for a small server that shares its memory with
+# other services: its job is only to unpack an image.
+#
+# Build the binary on the workstation, for the server's platform:
+#   CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" \
+#     -o reasonix-selfhost ./cmd/reasonix-selfhost
+#
+# then put the binary in the build context root, beside this file, and build
+# with: docker compose build selfhost     # see docker-compose.yml in the guide
+#
+# The context here is the deployment directory, which also holds `data/` and
+# `selfhost.env`; a `.dockerignore` keeps both out of the image.
+FROM alpine:3.21
+RUN adduser -D -u 10001 reasonix && mkdir -p /data && chown reasonix /data
+COPY reasonix-selfhost /usr/local/bin/reasonix-selfhost
+RUN chmod +x /usr/local/bin/reasonix-selfhost
+USER reasonix
+WORKDIR /data
+ENV REASONIX_SELFHOST_ADDR=0.0.0.0:8790 \
+    REASONIX_SELFHOST_DATA=/data
+VOLUME ["/data"]
+EXPOSE 8790
+ENTRYPOINT ["/usr/local/bin/reasonix-selfhost"]

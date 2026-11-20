@@ -1,0 +1,14 @@
+# Build context for `deploy/Dockerfile` (context: .), used by CI and by anyone
+# building from source. The Go sources are all that build needs; everything
+# here would otherwise be shipped to the daemon and then discarded.
+.git
+.github
+docs
+*.md
+data
+*.db
+*.db-wal
+*.db-shm
+selfhost.env
+*.env
+*.local.md
