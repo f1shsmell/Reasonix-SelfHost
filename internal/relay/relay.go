@@ -13,6 +13,8 @@ import (
 	"errors"
 	"net/http"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/gorilla/websocket"
 
@@ -31,6 +33,16 @@ const heartbeat = 20_000
 // above 64 KiB, so a larger frame cannot be a legal one; the limit keeps a
 // hostile controller from making the relay buffer without end.
 const maxFrame = 96 << 10
+
+// writeDeadline bounds one socket write, in nanoseconds. Without it a
+// controller that stops reading (dead radio, backgrounded WebView) blocks
+// deliver inside the device read loop, stalling every other controller on that
+// device. Ten seconds carries a full 96 KiB frame over a link far slower than
+// any phone we serve; a write that cannot finish in it means the peer is gone,
+// so the socket closes. Atomic so tests can shorten it while sockets live.
+var writeDeadline atomic.Int64
+
+func init() { writeDeadline.Store(int64(10 * time.Second)) }
 
 // Relay owns the live sockets. Device connections are keyed by device id;
 // controllers are keyed by the connection id the relay invents for them.
@@ -115,14 +127,21 @@ func (r *Relay) runDevice(deviceID string, link *deviceLink) {
 		if r.devices[deviceID] == link {
 			delete(r.devices, deviceID)
 		}
+		controllers := link.controllers
+		link.controllers = map[string]*controllerLink{}
 		r.mu.Unlock()
-		link.closeControllers()
+		for _, controller := range controllers {
+			_ = controller.conn.Close()
+		}
 		_ = link.conn.Close()
 	}()
 
 	// The device is told what it already has, so it can drop sessions the relay
 	// no longer holds before any controller speaks.
-	link.sendHello()
+	r.mu.Lock()
+	ids := controllerIDs(link)
+	r.mu.Unlock()
+	link.sendHello(ids)
 
 	for {
 		_, payload, err := link.conn.ReadMessage()
@@ -154,11 +173,18 @@ func (r *Relay) runDevice(deviceID string, link *deviceLink) {
 	}
 }
 
-func (link *deviceLink) sendHello() {
+// controllerIDs snapshots the attached controllers; the caller holds r.mu,
+// the only lock guarding the controllers map. The snapshot lets sendHello
+// write outside the lock instead of reading the map during a socket write.
+func controllerIDs(link *deviceLink) []string {
 	ids := make([]string, 0, len(link.controllers))
 	for id := range link.controllers {
 		ids = append(ids, id)
 	}
+	return ids
+}
+
+func (link *deviceLink) sendHello(ids []string) {
 	link.sendJSON(map[string]any{
 		"type": "relay_hello", "controllers": ids, "heartbeatMs": heartbeat,
 	})
@@ -171,16 +197,14 @@ func (link *deviceLink) sendJSON(value any) error {
 	}
 	link.write.Lock()
 	defer link.write.Unlock()
-	return link.conn.WriteMessage(websocket.TextMessage, wire)
-}
-
-func (link *deviceLink) closeControllers() {
-	link.write.Lock()
-	defer link.write.Unlock()
-	for _, controller := range link.controllers {
-		_ = controller.conn.Close()
+	_ = link.conn.SetWriteDeadline(time.Now().Add(time.Duration(writeDeadline.Load())))
+	err = link.conn.WriteMessage(websocket.TextMessage, wire)
+	if err != nil {
+		// A failed write leaves the socket unusable; closing it is what lets
+		// runDevice notice and release every controller attached to it.
+		_ = link.conn.Close()
 	}
-	link.controllers = map[string]*controllerLink{}
+	return err
 }
 
 // ---- controller side -------------------------------------------------
@@ -237,8 +261,10 @@ func (r *Relay) ControllerConnect(w http.ResponseWriter, req *http.Request) {
 
 	r.mu.Lock()
 	current := r.devices[grant.DeviceID]
+	var ids []string
 	if current != nil {
 		current.controllers[id] = link
+		ids = controllerIDs(current)
 	}
 	r.mu.Unlock()
 	if current == nil {
@@ -255,7 +281,7 @@ func (r *Relay) ControllerConnect(w http.ResponseWriter, req *http.Request) {
 		_ = conn.Close()
 		return
 	}
-	current.sendHello()
+	current.sendHello(ids)
 
 	go r.runController(grant.DeviceID, id, link, grant.Scopes)
 }
@@ -298,7 +324,12 @@ func (r *Relay) deliver(deviceID, connectionID, payload string) {
 	}
 	target.write.Lock()
 	defer target.write.Unlock()
-	_ = target.conn.WriteMessage(websocket.TextMessage, []byte(payload))
+	_ = target.conn.SetWriteDeadline(time.Now().Add(time.Duration(writeDeadline.Load())))
+	if err := target.conn.WriteMessage(websocket.TextMessage, []byte(payload)); err != nil {
+		// Closing unblocks runController's read, whose defer runs disconnect
+		// and tells the device — the same path a peer-initiated close takes.
+		_ = target.conn.Close()
+	}
 }
 
 // toDevice sends a routing frame to the Studio, if it is still connected.
@@ -323,9 +354,11 @@ func (r *Relay) disconnect(deviceID, connectionID string) {
 	r.mu.Lock()
 	device := r.devices[deviceID]
 	var target *controllerLink
+	var ids []string
 	if device != nil {
 		target = device.controllers[connectionID]
 		delete(device.controllers, connectionID)
+		ids = controllerIDs(device)
 	}
 	r.mu.Unlock()
 	if target != nil {
@@ -333,7 +366,7 @@ func (r *Relay) disconnect(deviceID, connectionID string) {
 	}
 	if device != nil {
 		_ = device.sendJSON(map[string]any{"type": "controller_disconnected", "connectionId": connectionID})
-		device.sendHello()
+		device.sendHello(ids)
 	}
 }
 
