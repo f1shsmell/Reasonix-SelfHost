@@ -231,6 +231,36 @@ that already, so `selfhost.env` should not override `ADDR`. Only `caddy`
 publishes ports; the service is reachable as `selfhost:8790` from the Caddy
 container and from nowhere else.
 
+#### Or pull a prebuilt image
+
+This repository builds the image on GitHub's runners (`.github/workflows/image.yml`)
+and publishes it to GHCR, so nothing has to be compiled here. Two things to
+know the first time:
+
+- **The package starts private**, even though the repository is public. Open
+  the repository's *Packages*, then the package's settings, and change its
+  visibility to **Public**. Without that, `docker pull` answers
+  `unauthorized` no matter how correct the path is.
+- **The path is lowercase.** GHCR rejects uppercase, so `…-SelfHost` in the
+  repository name becomes `…-selfhost` in the image name.
+
+```bash
+docker pull ghcr.io/f1shsmell/reasonix-selfhost:latest
+```
+
+In `docker-compose.yml`, drop the whole `build:` block and keep only the image
+line:
+
+```yaml
+  selfhost:
+    image: ghcr.io/f1shsmell/reasonix-selfhost:latest
+```
+
+`docker compose up -d` then fetches it. Tags: a `v1.2.3` release publishes
+`1.2.3`, `1.2`, `latest` and `sha-<commit>`; a manual run of the workflow
+publishes only `latest` and `sha-<commit>`, so it can never overwrite a
+released version number.
+
 ### 6. Make the data directory writable
 
 The image runs as UID `10001`. A bind mount keeps the host's ownership, so the
@@ -357,6 +387,68 @@ copying it while the service writes produces a backup that may not open.
 git -C app pull
 docker compose up -d --build
 ```
+
+That rebuilds from source, which needs the Go toolchain and peaks at 1.5–2 GB
+of RAM. On a small host — one that shares its memory with other services — the
+build can starve the machine until sshd stops answering. Build the binary on
+your workstation instead and copy it in; `deploy/Dockerfile.runtime` does
+nothing but place it.
+
+Build from the checkout **on your workstation** — that is the tree the binary
+comes from, so pull there, not on the server:
+
+```bash
+cd app                                   # the clone on your workstation
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" \
+  -o reasonix-selfhost ./cmd/reasonix-selfhost
+scp reasonix-selfhost you@server:/srv/reasonix-selfhost/
+```
+
+`GOARCH=arm64` instead of `amd64` on an ARM host — check with `uname -m` on the
+server. The image is `FROM alpine`, so a wrong architecture shows up as
+`exec format error` the moment the container starts.
+
+Then copy `deploy/Dockerfile.runtime` from the clone to the deployment
+directory beside the binary, and point the `selfhost` service's `build:` block
+at it — **dropping its `args:`**, since the runtime Dockerfile declares none:
+
+```bash
+scp app/deploy/Dockerfile.runtime you@server:/srv/reasonix-selfhost/
+```
+
+```yaml
+    build:
+      context: .
+      dockerfile: Dockerfile.runtime
+```
+
+`dockerfile:` resolves relative to `context`, so keeping both files at the
+deployment root is what makes this one line work. (Putting it at
+`dockerfile: app/deploy/Dockerfile.runtime` also works — the path just has to
+stay inside the context.)
+
+The context is now the deployment directory, which also holds `data/` and
+`selfhost.env`. Keep them out of it with a `.dockerignore` beside the binary:
+
+```
+# /srv/reasonix-selfhost/.dockerignore
+data
+selfhost.env
+app
+*.db*
+```
+
+An allowlist (`*` then `!reasonix-selfhost`) sends less data, but it fails with
+`COPY ... not found` if the binary is ever renamed. Either works; the explicit
+list above is the forgiving one.
+
+```bash
+docker compose build selfhost     # seconds, no toolchain
+docker compose up -d              # build alone leaves the old container running
+```
+
+Step 5 above builds from source, which is fine on a host with memory to spare;
+this is the path to switch to when the server has little.
 
 **Rotate the admin token.** Change `REASONIX_SELFHOST_ADMIN_TOKEN` in
 `selfhost.env` and restart. Sessions already issued keep working; only future

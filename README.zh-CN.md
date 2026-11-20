@@ -210,6 +210,32 @@ networks:
 `ADDR`。只有 `caddy` 对外发布端口；服务只能从 Caddy 容器以 `selfhost:8790` 访问，
 别处够不着。
 
+#### 或者直接拉现成镜像
+
+本仓库用 GitHub 的 runner 构建镜像（`.github/workflows/image.yml`）并发布到
+GHCR，所以这台机器上什么都不用编译。第一次有两件事要知道：
+
+- **包默认是 private**，即使仓库是 public。打开仓库的 *Packages*，进包设置，
+  把可见性改成 **Public**。不改的话，`docker pull` 会返回 `unauthorized`，
+  路径写得再对也没用。
+- **路径是全小写**。GHCR 拒绝大写，所以仓库名里的 `…-SelfHost` 在镜像名里
+  是 `…-selfhost`。
+
+```bash
+docker pull ghcr.io/f1shsmell/reasonix-selfhost:latest
+```
+
+在 `docker-compose.yml` 里，整个 `build:` 块删掉，只留镜像那一行：
+
+```yaml
+  selfhost:
+    image: ghcr.io/f1shsmell/reasonix-selfhost:latest
+```
+
+之后 `docker compose up -d` 就会拉取。标签规则：发 `v1.2.3` 会发布 `1.2.3`、
+`1.2`、`latest` 和 `sha-<commit>`；手动跑 workflow 只发布 `latest` 和
+`sha-<commit>`，所以它永远不会覆盖已发布的版本号。
+
 ### 6. 让数据目录可写
 
 镜像以 UID `10001` 运行。绑定挂载会保留宿主的所有权，所以目录得对得上：
@@ -323,6 +349,61 @@ docker compose start selfhost
 git -C app pull
 docker compose up -d --build
 ```
+
+这是从源码重建，需要 Go 工具链，内存峰值 1.5–2 GB。在小机器上——那种还跟别的
+服务共用内存的——构建会把机器压到 sshd 都不应答。改成**在你自己的电脑上**编译好、
+只把二进制拷过去；`deploy/Dockerfile.runtime` 只做这一件事。
+
+在你电脑的检出里构建——二进制出自那棵树，所以在那里 pull，不是在服务器上：
+
+```bash
+cd app                                   # 你电脑上的 clone
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" \
+  -o reasonix-selfhost ./cmd/reasonix-selfhost
+scp reasonix-selfhost you@server:/srv/reasonix-selfhost/
+```
+
+ARM 主机把 `amd64` 换成 `GOARCH=arm64`，用服务器上的 `uname -m` 确认。镜像是
+`FROM alpine`，架构不对会在容器启动的瞬间报 `exec format error`。
+
+再把 clone 里的 `deploy/Dockerfile.runtime` 拷到部署目录、和二进制放在一起，
+然后把 `selfhost` 服务的 `build:` 块指向它——**同时删掉它的 `args:`**，
+runtime Dockerfile 不声明任何构建参数：
+
+```bash
+scp app/deploy/Dockerfile.runtime you@server:/srv/reasonix-selfhost/
+```
+
+```yaml
+    build:
+      context: .
+      dockerfile: Dockerfile.runtime
+```
+
+`dockerfile:` 是相对 `context` 解析的，两个文件都放在部署根目录，这一行才成立。
+（写成 `dockerfile: app/deploy/Dockerfile.runtime` 也可以——路径留在 context
+里面就行。）
+
+现在的构建上下文是部署目录，那里还躺着 `data/` 和 `selfhost.env`。用一份放在
+二进制旁边的 `.dockerignore` 把它们挡在外面：
+
+```
+# /srv/reasonix-selfhost/.dockerignore
+data
+selfhost.env
+app
+*.db*
+```
+
+白名单写法（先 `*` 再 `!reasonix-selfhost`）传的数据更少，但二进制一旦改名就会
+报 `COPY ... not found`。两种都行，上面这份显式列表是容错的那种。
+
+```bash
+docker compose build selfhost     # 几秒，不碰工具链
+docker compose up -d              # 只 build 的话旧容器还在跑
+```
+
+上面第 5 步那份是从源码构建的，机器内存宽裕时没问题；内存紧张时换成这条路。
 
 **轮换管理员令牌。** 改 `selfhost.env` 里的 `REASONIX_SELFHOST_ADMIN_TOKEN` 后重启。
 已发出的会话继续有效；只有之后的批准需要新令牌。
