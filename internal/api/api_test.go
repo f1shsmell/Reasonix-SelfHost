@@ -36,14 +36,14 @@ func newHarness(t *testing.T) *harness {
 	t.Cleanup(func() { _ = st.Close() })
 
 	cfg := config.Config{
-		Addr:        "127.0.0.1:0",
-		DataDir:     t.TempDir(),
-		PublicURL:   "https://id.example.test",
-		RelayURL:    "https://relay.example.test",
-		OwnerHandle: "owner",
-		AdminToken:  adminToken,
-		GrantTTL:    2 * time.Minute,
-		TicketTTL:   time.Minute,
+		Addr:           "127.0.0.1:0",
+		DataDir:        t.TempDir(),
+		PublicURL:      "https://id.example.test",
+		RelayURL:       "https://relay.example.test",
+		OwnerHandle:    "owner",
+		AdminToken:     adminToken,
+		GrantTTL:       2 * time.Minute,
+		TicketTTL:      time.Minute,
 		AllowedOrigins: []string{"https://app.example.test"},
 	}
 	server, err := New(cfg, st)
@@ -664,4 +664,42 @@ func readFrame(t *testing.T, conn *websocket.Conn) map[string]any {
 		t.Fatalf("relay frame %q: %v", payload, err)
 	}
 	return frame
+}
+
+func TestGrantValidatesScopes(t *testing.T) {
+	h := newHarness(t)
+	token := h.signIn()
+	status, registered := h.do(http.MethodPost, "/me/devices", token, map[string]any{
+		"name": "test-studio", "platform": "linux", "publicKey": "cHVibGljLWtleQ",
+		"capabilities": []string{"desktop", "files"},
+	})
+	if status != http.StatusOK {
+		t.Fatalf("register device = %d %v", status, registered)
+	}
+	device, _ := registered["device"].(map[string]any)
+	deviceID, _ := device["id"].(string)
+
+	for _, tc := range []struct {
+		scopes []string
+		want   int
+	}{
+		{[]string{"files"}, http.StatusOK},
+		{[]string{"desktop", "files"}, http.StatusOK},
+		{nil, http.StatusOK},
+		{[]string{"bogus"}, http.StatusBadRequest},
+		{[]string{"terminal"}, http.StatusBadRequest},
+		{[]string{"files", "bogus"}, http.StatusBadRequest},
+	} {
+		body := map[string]any{"targetDeviceId": deviceID}
+		if tc.scopes != nil {
+			body["scopes"] = tc.scopes
+		}
+		status, out := h.do(http.MethodPost, "/me/remote-grants", token, body)
+		if status != tc.want {
+			t.Fatalf("scopes %v = %d %v, want %d", tc.scopes, status, out, tc.want)
+		}
+		if status == http.StatusBadRequest && out["code"] != "invalid_scopes" {
+			t.Fatalf("scopes %v error = %v", tc.scopes, out)
+		}
+	}
 }
