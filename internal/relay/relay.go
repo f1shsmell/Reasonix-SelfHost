@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,9 +22,23 @@ import (
 	"github.com/f1shsmell/Reasonix-SelfHost/internal/store"
 )
 
-// The scope a self-hosted controller is granted. The kernel checks this list
+// The scopes a self-hosted controller may hold. The kernel checks this list
 // before running anything, so a relay that widened it would widen the kernel.
-const desktopScope = "desktop"
+var knownScopes = []string{"tasks", "logs", "files", "desktop", "terminal"}
+
+// KnownScope reports whether a scope is one the kernel understands.
+func KnownScope(scope string) bool {
+	return slices.Contains(knownScopes, scope)
+}
+
+func hasKnownScope(scopes []string) bool {
+	for _, scope := range scopes {
+		if KnownScope(scope) {
+			return true
+		}
+	}
+	return false
+}
 
 // heartbeat is how often the device should ping, in milliseconds. The kernel
 // clamps whatever is sent to between 5 s and one minute.
@@ -227,8 +242,8 @@ func (r *Relay) ControllerConnect(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "no grant", http.StatusServiceUnavailable)
 		return
 	}
-	if !hasScope(grant.Scopes, desktopScope) {
-		http.Error(w, "grant lacks desktop scope", http.StatusForbidden)
+	if !hasKnownScope(grant.Scopes) {
+		http.Error(w, "grant carries no known scope", http.StatusForbidden)
 		return
 	}
 
@@ -392,15 +407,6 @@ func ticketFromSubprotocols(offered []string) (ticket string, ok bool) {
 		}
 	}
 	return ticket, found
-}
-
-func hasScope(scopes []string, want string) bool {
-	for _, scope := range scopes {
-		if scope == want {
-			return true
-		}
-	}
-	return false
 }
 
 var connectionCounter struct {

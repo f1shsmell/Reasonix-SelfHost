@@ -649,6 +649,12 @@ func (s *Server) grant(w http.ResponseWriter, req *http.Request) {
 	if len(scopes) == 0 {
 		scopes = []string{"desktop"}
 	}
+	for _, scope := range scopes {
+		if !relay.KnownScope(scope) || !containsScope(device.Capabilities, scope) {
+			s.fail(w, http.StatusBadRequest, "invalid_scopes", "Scopes must be ones the device offers.")
+			return
+		}
+	}
 	ticket, err := s.store.IssueTicket(device.ID, user.ID, scopes, s.cfg.TicketTTL)
 	if err != nil {
 		s.fail(w, http.StatusInternalServerError, "internal", "Could not mint a grant.")

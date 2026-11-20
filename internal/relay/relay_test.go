@@ -68,10 +68,21 @@ func (h *relayHarness) dialDevice() *websocket.Conn {
 
 func (h *relayHarness) dialController() *websocket.Conn {
 	h.t.Helper()
-	ticket, err := h.store.IssueTicket(h.deviceID, h.userID, []string{"desktop"}, time.Minute)
+	return h.dialControllerWithScopes([]string{"desktop"})
+}
+
+func (h *relayHarness) controllerTicket(scopes []string) string {
+	h.t.Helper()
+	ticket, err := h.store.IssueTicket(h.deviceID, h.userID, scopes, time.Minute)
 	if err != nil {
 		h.t.Fatalf("issue ticket: %v", err)
 	}
+	return ticket
+}
+
+func (h *relayHarness) dialControllerWithScopes(scopes []string) *websocket.Conn {
+	h.t.Helper()
+	ticket := h.controllerTicket(scopes)
 	url := "ws" + strings.TrimPrefix(h.server.URL, "http") + "/v1/sessions/connect"
 	dialer := websocket.Dialer{Subprotocols: []string{"reasonix.remote.v1", "reasonix.auth." + ticket}}
 	conn, _, err := dialer.Dial(url, nil)
@@ -224,5 +235,55 @@ func TestStalledDeviceReleasesControllers(t *testing.T) {
 	_ = controller.SetReadDeadline(time.Now().Add(3 * time.Second))
 	if _, _, err := controller.ReadMessage(); err == nil {
 		t.Fatal("controller outlived the stalled device")
+	}
+}
+
+// A files-only grant connects, and the scopes cross to the device exactly as
+// minted: the relay forwards the list, it never edits it.
+func TestFilesOnlyGrantConnectsAndScopesCrossUnchanged(t *testing.T) {
+	h := newRelayHarness(t)
+	deviceConn := h.dialDevice()
+	if hello := readFrame(t, deviceConn, 3*time.Second); hello["type"] != "relay_hello" {
+		t.Fatalf("device hello = %v", hello)
+	}
+	controller := h.dialControllerWithScopes([]string{"files"})
+	id := awaitConnectionID(t, deviceConn)
+	if err := controller.WriteMessage(websocket.TextMessage, []byte("sealed-request")); err != nil {
+		t.Fatalf("controller write: %v", err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		frame := readFrame(t, deviceConn, time.Until(deadline))
+		if frame["type"] != "controller_message" {
+			continue
+		}
+		if frame["payload"] != "sealed-request" || frame["connectionId"] != id {
+			t.Fatalf("controller_message = %v", frame)
+		}
+		scopes, _ := frame["scopes"].([]any)
+		if len(scopes) != 1 || scopes[0] != "files" {
+			t.Fatalf("forwarded scopes = %v, want [files]", frame["scopes"])
+		}
+		return
+	}
+	t.Fatal("the device never saw the controller's message")
+}
+
+func TestGrantWithoutAKnownScopeIsRefused(t *testing.T) {
+	h := newRelayHarness(t)
+	// The store defaults an empty list to desktop, so only a list of unknown
+	// names can reach the gate without a known scope.
+	for _, scopes := range [][]string{{"bogus"}, {"bogus", "worse"}} {
+		ticket := h.controllerTicket(scopes)
+		url := "ws" + strings.TrimPrefix(h.server.URL, "http") + "/v1/sessions/connect"
+		dialer := websocket.Dialer{Subprotocols: []string{"reasonix.remote.v1", "reasonix.auth." + ticket}}
+		conn, resp, err := dialer.Dial(url, nil)
+		if err == nil {
+			_ = conn.Close()
+			t.Fatalf("scopes %v connected, want a refusal", scopes)
+		}
+		if resp == nil || resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("scopes %v dial = %v (resp %v), want 403", scopes, err, resp)
+		}
 	}
 }
