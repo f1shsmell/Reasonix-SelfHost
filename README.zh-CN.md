@@ -213,13 +213,7 @@ networks:
 #### 或者直接拉现成镜像
 
 本仓库用 GitHub 的 runner 构建镜像（`.github/workflows/image.yml`）并发布到
-GHCR，所以这台机器上什么都不用编译。第一次有两件事要知道：
-
-- **包默认是 private**，即使仓库是 public。打开仓库的 *Packages*，进包设置，
-  把可见性改成 **Public**。不改的话，`docker pull` 会返回 `unauthorized`，
-  路径写得再对也没用。
-- **路径是全小写**。GHCR 拒绝大写，所以仓库名里的 `…-SelfHost` 在镜像名里
-  是 `…-selfhost`。
+GHCR，所以这台机器上什么都不用编译。
 
 ```bash
 docker pull ghcr.io/f1shsmell/reasonix-selfhost:latest
@@ -235,6 +229,15 @@ docker pull ghcr.io/f1shsmell/reasonix-selfhost:latest
 之后 `docker compose up -d` 就会拉取。标签规则：发 `v1.2.3` 会发布 `1.2.3`、
 `1.2`、`latest` 和 `sha-<commit>`；手动跑 workflow 只发布 `latest` 和
 `sha-<commit>`，所以它永远不会覆盖已发布的版本号。
+
+如果拉取失败，有两件事值得查：
+
+- **路径是全小写**。GHCR 拒绝大写，所以仓库名里的 `…-SelfHost` 在镜像名里
+  是 `…-selfhost`。
+- **包的可见性和仓库是分开的**。当前发布的包是匿名可读的，上面那条不带登录
+  的 `docker pull` 才能直接用。将来某次发布若返回 `unauthorized`，打开仓库的
+  *Packages*、进包设置，把可见性改成 **Public**——GHCR 新建包的默认值是
+  private，只有第一次发布继承仓库的可见性。
 
 ### 6. 让数据目录可写
 

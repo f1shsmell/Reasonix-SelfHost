@@ -234,15 +234,7 @@ container and from nowhere else.
 #### Or pull a prebuilt image
 
 This repository builds the image on GitHub's runners (`.github/workflows/image.yml`)
-and publishes it to GHCR, so nothing has to be compiled here. Two things to
-know the first time:
-
-- **The package starts private**, even though the repository is public. Open
-  the repository's *Packages*, then the package's settings, and change its
-  visibility to **Public**. Without that, `docker pull` answers
-  `unauthorized` no matter how correct the path is.
-- **The path is lowercase.** GHCR rejects uppercase, so `…-SelfHost` in the
-  repository name becomes `…-selfhost` in the image name.
+and publishes it to GHCR, so nothing has to be compiled here.
 
 ```bash
 docker pull ghcr.io/f1shsmell/reasonix-selfhost:latest
@@ -260,6 +252,17 @@ line:
 `1.2.3`, `1.2`, `latest` and `sha-<commit>`; a manual run of the workflow
 publishes only `latest` and `sha-<commit>`, so it can never overwrite a
 released version number.
+
+Two things worth knowing if the pull does not work:
+
+- **The path is lowercase.** GHCR rejects uppercase, so `…-SelfHost` in the
+  repository name becomes `…-selfhost` in the image name.
+- **A package's visibility can differ from its repository's.** The published
+  package is anonymous-readable, which is what makes the bare `docker pull`
+  above work. If a future publish comes back `unauthorized`, open the
+  repository's *Packages*, then the package's settings, and set visibility to
+  **Public** — GHCR's default for a newly created package is private, and only
+  the first publish inherits the repository's.
 
 ### 6. Make the data directory writable
 
